@@ -1,5 +1,6 @@
 #include "ki_json/json_generator.h"
 
+#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,6 +9,13 @@
 
 #include "print_buffer.h"
 #include "ki_json/json.h"
+
+#define IS_CONTROL_CODEPOINT(codepoint) (codepoint < 0x001F || (codepoint >= 0x0080 && codepoint <= 0x009F))
+
+//ref: https://en.wikipedia.org/wiki/UTF-16#U+D800_to_U+DFFF_(surrogates)
+#define CODEPOINT_HIGH_SURROGATE(codepoint) (((codepoint - 0x10000) >> 10) + 0xD800)
+// (...) & ((1 << 10) - 1) takes 10 lowest bits
+#define CODEPOINT_LOW_SURROGATE(codepoint) (((codepoint - 0x10000) & ((1 << 10) - 1)) + 0xDC00)
 
 struct json_generator
 {
@@ -87,14 +95,41 @@ static uint32_t utf8_to_codepoint(unsigned char* bytes)
 
 #pragma region Printing
 
-// Prints a ASCII character inside a string value (escaped if needed) into print buffer.
+// Prints json-formatted unicode codepoint (utf-16 literal) into print buffer.
 // Returns true on success, and false on fail.
-static bool print_formatted_string_ascii_char(struct print_buffer* buffer, char character)
+// TODO: test
+static bool print_codepoint(struct print_buffer* buffer, uint32_t codepoint)
+{
+    assert(buffer && codepoint <= 0x10FFFF);
+
+    //no buffer or invalid codepoint
+    if (buffer == NULL || codepoint > 0x10FFFF)
+        return false;
+
+    //ref: https://en.wikipedia.org/wiki/UTF-16#U+D800_to_U+DFFF_(surrogates)
+
+    //surrogate pair
+    if (codepoint >= 0x10000 && codepoint <= 0x10FFFF)
+    {
+        char escaped[13]; // \uXXXX\uXXXX\0
+        snprintf(escaped, sizeof(escaped), "\\u%04.4X\\u%04.4X", CODEPOINT_HIGH_SURROGATE(codepoint), CODEPOINT_LOW_SURROGATE(codepoint));
+        return print_buffer_append_string(buffer, escaped);
+    }
+    else 
+    {
+        char escaped[7]; // \uXXXX\0
+        snprintf(escaped, sizeof(escaped), "\\u%04.4X", codepoint);
+        return print_buffer_append_string(buffer, escaped);
+    }
+}
+
+//TODO: comment
+static bool print_control_char(struct print_buffer* buffer, unsigned char control_char)
 {
     if (buffer == NULL)
         return false;
 
-    switch(character)
+    switch(control_char)
     {
         case '\"': //double quotation marks
             return print_buffer_append_string(buffer, "\\n");
@@ -111,14 +146,9 @@ static bool print_formatted_string_ascii_char(struct print_buffer* buffer, char 
         case '\t': //horizontal tab
             return print_buffer_append_string(buffer, "\\t");
         default:
-            return print_buffer_append_char(buffer, character);
+            return print_codepoint(buffer, (uint32_t)control_char);
     }
 }
-
-// Prints codepoint into print buffer.
-// Supports 4-hex digits only. (Basically 16-bits only, lol)
-// Returns true on success, and false on fail.
-static bool print_codepoint(uint32_t codepoint);
 
 // Prints json-formatted string into print buffer.
 // Returns true on success, and false on fail.
@@ -135,9 +165,9 @@ static bool print_string(struct print_buffer* buffer, const char* string)
     
     while (string[pos] != '\0')
     {
-        //TODO: utf8 escaping
+        unsigned char byte = (unsigned char)string[pos];
 
-        if (!print_formatted_string_ascii_char(buffer, string[pos]))
+        if ((IS_CONTROL_CODEPOINT(byte) && !print_control_char(buffer, byte)) || !print_buffer_append_char(buffer, string[pos]))
             return false;
 
         pos++;
